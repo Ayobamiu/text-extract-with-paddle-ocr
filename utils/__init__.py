@@ -3,6 +3,7 @@
 from .extractors import (
     extract_storage_data,
     extract_openai_feed_from_storage,
+    extract_openai_feed_markdown_from_storage,
     extract_openai_feed_data,
     build_markdown_to_block_map,
     convert_to_mineru_format,
@@ -11,6 +12,7 @@ from .extractors import (
 __all__ = [
     "extract_storage_data",
     "extract_openai_feed_from_storage",
+    "extract_openai_feed_markdown_from_storage",
     "extract_openai_feed_data",
     "build_markdown_to_block_map",
     "convert_to_mineru_format",

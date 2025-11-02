@@ -9,6 +9,7 @@ Functions:
 import json
 from typing import Dict, Any, Optional
 from datetime import datetime
+from .table_converter import html_to_markdown_table
 
 
 def extract_storage_data(
@@ -73,6 +74,17 @@ def extract_storage_data(
             block_content = block.get("block_content", "")
             block_bbox = block.get("block_bbox", [])
             block_order = block.get("block_order")
+
+            # Convert HTML tables to markdown format
+            if block_label and block_label.lower() == "table" and block_content:
+                try:
+                    markdown_table = html_to_markdown_table(block_content)
+                    if markdown_table:
+                        block_content = markdown_table
+                except Exception as e:
+                    # If conversion fails, keep original HTML content
+                    # Log error but don't break the extraction
+                    print(f"Warning: Failed to convert table in block {block_id}: {e}")
 
             # Try to find this block's content in the markdown
             # This is a simplified approach - in production, you might need
@@ -170,8 +182,9 @@ def extract_openai_feed_from_storage(
     """
     Extract OpenAI feed data from storage_data.
 
-    This function extracts markdown text and source blocks with coordinates
-    from the processed storage data, formatted for OpenAI API consumption.
+    Simplified format to reduce token usage - only includes essential data:
+    - pageIndex for each page
+    - blockId and blockContent for source blocks (no markdown, bboxes, or labels)
 
     This is the preferred method since storage_data is the single source of truth.
 
@@ -179,14 +192,13 @@ def extract_openai_feed_from_storage(
         storage_data: The processed storage data from extract_storage_data()
 
     Returns:
-        Dictionary containing markdown and source blocks ready for OpenAI API
+        Dictionary containing simplified page and source blocks ready for OpenAI API
     """
-    document_id = storage_data.get("documentId", "unknown")
     pages_data = storage_data.get("pages", [])
 
     pages = []
     for page in pages_data:
-        # Extract only blocks with content
+        # Extract only blocks with content (simplified format)
         source_blocks = []
         for block in page.get("sourceBlocks", []):
             block_content = block.get("blockContent", "").strip()
@@ -196,23 +208,128 @@ def extract_openai_feed_from_storage(
             source_blocks.append(
                 {
                     "blockId": block.get("blockId"),
-                    "blockLabel": block.get("blockLabel"),
                     "blockContent": block_content,
-                    "blockBbox": block.get("blockBbox", []),
                 }
             )
 
         pages.append(
             {
                 "pageIndex": page.get("pageIndex"),
-                "pageWidth": page.get("pageWidth"),
-                "pageHeight": page.get("pageHeight"),
-                "markdown": page.get("markdown", {}).get("text", ""),
                 "sourceBlocks": source_blocks,
             }
         )
 
-    return {"documentId": document_id, "numPages": len(pages), "pages": pages}
+    return {"pages": pages}
+
+
+def _format_block_content_by_label(content: str, block_label: str) -> str:
+    """
+    Format block content based on its label using markdown syntax.
+
+    Args:
+        content: Block text content
+        block_label: Block label/type (e.g., "header", "footer", "doc_title")
+
+    Returns:
+        Formatted markdown string
+    """
+    if not content:
+        return ""
+
+    label_lower = block_label.lower() if block_label else ""
+
+    # Apply markdown formatting based on label
+    if label_lower == "doc_title":
+        # Document title - use h1
+        return f"# {content}"
+    elif label_lower == "header":
+        # Header - use h2
+        return f"## {content}"
+    elif label_lower == "paragraph_title":
+        # Paragraph/section title - use h3
+        return f"### {content}"
+    elif label_lower == "figure_title":
+        # Figure caption - use h4 or italic
+        return f"#### {content}"
+    elif label_lower == "footer":
+        # Footer - use italic or small text
+        return f"*{content}*"
+    elif label_lower == "vision_footnote":
+        # Footnote - use smaller text
+        return f"<small>{content}</small>"
+    elif label_lower == "table":
+        # Table - content is already converted to markdown in extract_storage_data()
+        # Return as-is (with proper spacing for markdown tables)
+        return content
+    elif label_lower == "number":
+        # Numbers - often formatting or emphasis
+        return f"**{content}**"
+    else:
+        # Default: "text" or unknown - return as plain text
+        return content
+
+
+def extract_openai_feed_markdown_from_storage(
+    storage_data: Dict[str, Any], blocked: bool = False
+) -> str:
+    """
+    Extract OpenAI feed data from storage_data in markdown format.
+
+    Converts the structured storage_data into a markdown text format that is
+    more token-efficient than JSON while still preserving page and block identifiers
+    for source location tracking. Applies markdown formatting based on block labels.
+
+    Format:
+    === PAGE 1 ===
+    [BLOCK: 0]
+    # Document Title (formatted based on label)
+
+    [BLOCK: 1]
+    ## Header Text (formatted based on label)
+
+    === PAGE 2 ===
+    ...
+
+    Args:
+        storage_data: The processed storage data from extract_storage_data()
+
+    Returns:
+        Markdown string ready for OpenAI API consumption
+    """
+    pages_data = storage_data.get("pages", [])
+
+    lines = []
+    for page in pages_data:
+        page_index = page.get("pageIndex", 0)
+        source_blocks = page.get("sourceBlocks", [])
+
+        if blocked:
+            # Page header (display page number starting from 1 instead of 0 for blocked mode)
+            lines.append(f"=== PAGE {page_index + 1} ===\n")
+
+        # Add each block with content
+        for block in source_blocks:
+            block_id = block.get("blockId", "")
+            block_content = block.get("blockContent", "").strip()
+            block_label = block.get("blockLabel", "")
+
+            if not block_content:
+                continue
+
+            # Block identifier
+            if blocked:
+                lines.append(f"[BLOCK: {block_id}]\n")
+
+            # Format content based on block label
+            formatted_content = _format_block_content_by_label(
+                block_content, block_label
+            )
+            lines.append(formatted_content)
+
+            # Empty line between blocks for readability
+            lines.append("")
+
+    return "\n".join(lines)
 
 
 def convert_to_mineru_format(
