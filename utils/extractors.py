@@ -7,9 +7,58 @@ Functions:
 """
 
 import json
+import re
 from typing import Dict, Any, Optional
 from datetime import datetime
 from .table_converter import html_to_markdown_table
+
+
+def convert_html_tables_in_markdown(markdown_text: str) -> str:
+    """
+    Convert all HTML tables in markdown text to markdown format.
+
+    This function finds all <table>...</table> blocks in the markdown text,
+    converts each one to markdown format using html_to_markdown_table(),
+    and replaces them in place while preserving the rest of the text.
+
+    Args:
+        markdown_text: Markdown string that may contain HTML tables
+
+    Returns:
+        Markdown string with all HTML tables converted to markdown format
+    """
+    if not markdown_text:
+        return markdown_text
+
+    # Quick check: if no tables, return immediately (performance optimization)
+    if "<table" not in markdown_text.lower():
+        return markdown_text
+
+    # Pattern to match complete <table>...</table> blocks
+    # Using non-greedy matching and DOTALL to handle multi-line tables
+    # Pre-compile for better performance
+    # Pattern matches: <table> with optional attributes (single or double quotes, spaces, etc.)
+    # Handles: attributes with spaces, single/double quotes, newlines, case-insensitive
+    # More explicit pattern to catch edge cases
+    table_pattern = re.compile(r"<table\b[^>]*>.*?</table>", re.DOTALL | re.IGNORECASE)
+
+    def replace_table(match):
+        """Replace a single HTML table with its markdown equivalent."""
+        html_table = match.group(0)
+        try:
+            # html_to_markdown_table already handles finding and converting tables
+            # It will extract the table content and convert it to markdown
+            markdown_table = html_to_markdown_table(html_table)
+            return markdown_table if markdown_table else html_table
+        except Exception as e:
+            # If conversion fails, keep original HTML and log warning
+            print(f"Warning: Failed to convert table in markdown: {e}")
+            return html_table
+
+    # Find and replace all tables in the markdown text
+    converted_markdown = table_pattern.sub(replace_table, markdown_text)
+
+    return converted_markdown
 
 
 def extract_storage_data(
@@ -66,6 +115,17 @@ def extract_storage_data(
         # Process source blocks with markdown mapping
         source_blocks = []
         markdown_text = markdown_data.get("text", "")
+
+        # Convert HTML tables in markdown_text to markdown format
+        if markdown_text:
+            try:
+                markdown_text = convert_html_tables_in_markdown(markdown_text)
+            except Exception as e:
+                # If conversion fails, keep original markdown
+                print(
+                    f"Warning: Failed to convert tables in markdown_text for page {page_index}: {e}"
+                )
+
         current_markdown_offset = 0
 
         for block in parsing_res_list:
@@ -173,6 +233,7 @@ def extract_storage_data(
         "documentId": document_id,
         "extractionMetadata": extraction_metadata,
         "pages": pages,
+        "markdown_text": markdown_text,
     }
 
 
