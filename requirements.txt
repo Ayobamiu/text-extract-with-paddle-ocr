@@ -1,0 +1,17 @@
+# PaddleOCR
+paddleocr
+# Note: opencv-contrib-python is installed as a dependency of paddleocr
+# Do NOT install opencv-python as it conflicts with opencv-contrib-python
+
+# Flask server
+Flask==3.0.0
+Flask-CORS==4.0.0
+gunicorn==21.2.0
+
+# HTTP client
+requests>=2.31.0
+
+# Utilities
+pillow>=10.0.0
+numpy>=1.24.0
+python-dotenv>=1.0.0
