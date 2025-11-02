@@ -233,7 +233,6 @@ def extract_storage_data(
         "documentId": document_id,
         "extractionMetadata": extraction_metadata,
         "pages": pages,
-        "markdown_text": markdown_text,
     }
 
 
