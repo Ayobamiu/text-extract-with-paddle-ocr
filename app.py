@@ -161,7 +161,11 @@ def extract_document():
                 "Authorization": f"token {API_TOKEN}",
                 "Content-Type": "application/json",
             }
-            payload = {"file": file_data, "fileType": file_type}
+            payload = {
+                "file": file_data,
+                "fileType": file_type,
+                "useChartRecognition": True,
+            }
 
             # Call PaddleOCR API
             logger.info(f"Sending request to API: {API_URL}")
@@ -214,7 +218,13 @@ def extract_document():
                 f"{sum(len(page['sourceBlocks']) for page in storage_data['pages'])} total blocks"
             )
 
-            return jsonify(storage_data), 200
+            # Include both processed storage_data and raw PaddleOCR response
+            response_data = {
+                **storage_data,
+                "raw_response": response_json,  # Include raw, unconverted PaddleOCR response
+            }
+
+            return jsonify(response_data), 200
 
         finally:
             # Clean up temporary file

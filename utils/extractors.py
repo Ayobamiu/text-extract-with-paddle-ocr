@@ -116,15 +116,8 @@ def extract_storage_data(
         source_blocks = []
         markdown_text = markdown_data.get("text", "")
 
-        # Convert HTML tables in markdown_text to markdown format
-        if markdown_text:
-            try:
-                markdown_text = convert_html_tables_in_markdown(markdown_text)
-            except Exception as e:
-                # If conversion fails, keep original markdown
-                print(
-                    f"Warning: Failed to convert tables in markdown_text for page {page_index}: {e}"
-                )
+        # Keep HTML tables as HTML (don't convert to markdown)
+        # Note: HTML tables will remain in their original format
 
         current_markdown_offset = 0
 
@@ -135,16 +128,12 @@ def extract_storage_data(
             block_bbox = block.get("block_bbox", [])
             block_order = block.get("block_order")
 
-            # Convert HTML tables to markdown format
+            # Keep HTML tables as HTML (don't convert to markdown)
+            # Replace escaped quotes with single quotes in table content
             if block_label and block_label.lower() == "table" and block_content:
-                try:
-                    markdown_table = html_to_markdown_table(block_content)
-                    if markdown_table:
-                        block_content = markdown_table
-                except Exception as e:
-                    # If conversion fails, keep original HTML content
-                    # Log error but don't break the extraction
-                    print(f"Warning: Failed to convert table in block {block_id}: {e}")
+                # Replace \" with ' in table content
+                # Using raw string or double backslash to match escaped quote
+                block_content = block_content.replace('\\"', "'")
 
             # Try to find this block's content in the markdown
             # This is a simplified approach - in production, you might need
