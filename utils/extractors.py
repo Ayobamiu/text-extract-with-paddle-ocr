@@ -8,9 +8,12 @@ Functions:
 
 import json
 import re
+import logging
 from typing import Dict, Any, Optional
 from datetime import datetime
 from .table_converter import html_to_markdown_table
+
+logger = logging.getLogger(__name__)
 
 
 def convert_html_tables_in_markdown(markdown_text: str) -> str:
@@ -115,6 +118,79 @@ def extract_storage_data(
         # Process source blocks with markdown mapping
         source_blocks = []
         markdown_text = markdown_data.get("text", "")
+        markdown_images = markdown_data.get("images", {})
+
+        # Download images from PaddleOCR and upload to S3, then replace URLs
+        image_url_mapping = {}  # Maps image_name -> new S3 URL
+        if markdown_images:
+            try:
+                from .s3_helper import (
+                    upload_image_to_s3,
+                    get_content_type_from_filename,
+                )
+                import requests
+
+                for image_name, paddleocr_url in markdown_images.items():
+                    if not image_name or not paddleocr_url:
+                        continue
+
+                    try:
+                        # Download image from PaddleOCR
+                        logger.info(
+                            f"📥 Downloading image: {image_name} from PaddleOCR"
+                        )
+                        response = requests.get(paddleocr_url, timeout=30, stream=True)
+                        response.raise_for_status()
+
+                        image_data = response.content
+
+                        # Upload to S3
+                        s3_key = f"images/{image_name}"
+                        content_type = get_content_type_from_filename(image_name)
+                        s3_url = upload_image_to_s3(
+                            image_data, s3_key, content_type=content_type
+                        )
+
+                        if s3_url:
+                            image_url_mapping[image_name] = s3_url
+                            logger.info(
+                                f"✅ Uploaded image to S3: {image_name} -> {s3_url[:50]}..."
+                            )
+                        else:
+                            # Fallback to original PaddleOCR URL if S3 upload fails
+                            image_url_mapping[image_name] = paddleocr_url
+                            logger.warning(
+                                f"⚠️ S3 upload failed for {image_name}, using original URL"
+                            )
+
+                    except Exception as img_error:
+                        # Fallback to original URL on error
+                        logger.error(
+                            f"❌ Error processing image {image_name}: {img_error}"
+                        )
+                        image_url_mapping[image_name] = paddleocr_url
+
+            except ImportError:
+                # S3 helper not available, use original URLs
+                logger.warning("S3 helper not available, using original PaddleOCR URLs")
+                image_url_mapping = markdown_images
+            except Exception as e:
+                logger.error(f"Error initializing S3 upload: {e}")
+                image_url_mapping = markdown_images
+
+        # Replace image keys in src attributes with actual URLs (S3 or PaddleOCR)
+        # Pattern: src="imageName" or src='imageName' -> src="imgURL" or src='imgURL'
+        for image_name, image_url in image_url_mapping.items():
+            if image_name and image_url:
+                # Escape special regex characters in image_name
+                escaped_image_name = re.escape(image_name)
+                # Replace src="imageName" or src='imageName' with src="imgURL"
+                # We'll use double quotes for consistency
+                markdown_text = re.sub(
+                    rf'src=["\']{escaped_image_name}["\']',
+                    f'src="{image_url}"',
+                    markdown_text,
+                )
 
         # Keep HTML tables as HTML (don't convert to markdown)
         # Note: HTML tables will remain in their original format

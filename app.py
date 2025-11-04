@@ -165,6 +165,7 @@ def extract_document():
                 "file": file_data,
                 "fileType": file_type,
                 "useChartRecognition": True,
+                "temperature": 0.2,
             }
 
             # Call PaddleOCR API
