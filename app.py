@@ -9,6 +9,8 @@ import base64
 import time
 import logging
 import tempfile
+from datetime import datetime
+from pathlib import Path
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
@@ -19,11 +21,39 @@ import requests
 # Load environment variables from .env file
 load_dotenv()
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
+# Create logs directory if it doesn't exist
+LOGS_DIR = Path(__file__).parent / "logs"
+LOGS_DIR.mkdir(exist_ok=True)
+
+# Configure logging with both console and file handlers
+log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+date_format = "%Y-%m-%d %H:%M:%S"
+
+# Console handler
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(logging.Formatter(log_format, date_format))
+
+# File handler for all logs
+log_file = LOGS_DIR / "app.log"
+file_handler = logging.FileHandler(log_file)
+file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(logging.Formatter(log_format, date_format))
+
+# File handler specifically for API errors
+error_log_file = LOGS_DIR / "api_errors.log"
+error_file_handler = logging.FileHandler(error_log_file)
+error_file_handler.setLevel(logging.ERROR)
+error_file_handler.setFormatter(logging.Formatter(log_format, date_format))
+
+# Configure root logger
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+root_logger.addHandler(console_handler)
+root_logger.addHandler(file_handler)
+root_logger.addHandler(error_file_handler)
+
+# Get logger for this module
 logger = logging.getLogger(__name__)
 
 # Initialize Flask app
@@ -179,9 +209,25 @@ def extract_document():
 
             # Check response status
             if response.status_code != 200:
+                error_details = {
+                    "timestamp": datetime.now().isoformat(),
+                    "filename": file.filename,
+                    "file_size": file_size,
+                    "status_code": response.status_code,
+                    "api_url": API_URL,
+                    "response_time_seconds": round(api_time, 2),
+                    "response_headers": dict(response.headers),
+                    "response_text": response.text[:2000],  # First 2000 chars
+                    "retry_after": response.headers.get("Retry-After")
+                    or response.headers.get("retry-after"),
+                }
+
+                # Log detailed error to file
                 logger.error(
-                    f"API request failed with status code {response.status_code}"
+                    f"API request failed with status code {response.status_code}\n"
+                    f"Error details: {error_details}"
                 )
+
                 return (
                     jsonify(
                         {
@@ -234,7 +280,13 @@ def extract_document():
                 logger.debug(f"Cleaned up temporary file: {temp_path}")
 
     except requests.exceptions.Timeout:
-        logger.error("API request timeout")
+        error_details = {
+            "timestamp": datetime.now().isoformat(),
+            "error_type": "Timeout",
+            "api_url": API_URL,
+            "timeout_seconds": 600,
+        }
+        logger.error(f"API request timeout\nError details: {error_details}")
         return (
             jsonify(
                 {"error": "API request timeout", "message": "Request took too long"}
@@ -242,7 +294,29 @@ def extract_document():
             504,
         )
     except requests.exceptions.RequestException as e:
-        logger.error(f"API request error: {str(e)}")
+        error_details = {
+            "timestamp": datetime.now().isoformat(),
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+            "api_url": API_URL,
+        }
+
+        # If it's a response exception, include response details
+        if hasattr(e, "response") and e.response is not None:
+            error_details.update(
+                {
+                    "status_code": e.response.status_code,
+                    "response_headers": dict(e.response.headers),
+                    "response_text": e.response.text[:2000]
+                    if e.response.text
+                    else None,
+                    "retry_after": e.response.headers.get("Retry-After")
+                    or e.response.headers.get("retry-after"),
+                }
+            )
+
+        logger.error(f"API request error: {str(e)}\nError details: {error_details}")
+
         return (
             jsonify({"error": "API request failed", "message": str(e)}),
             500,
