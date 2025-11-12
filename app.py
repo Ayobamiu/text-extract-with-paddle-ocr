@@ -198,45 +198,136 @@ def extract_document():
                 "temperature": 0.2,
             }
 
-            # Call PaddleOCR API
+            # Call PaddleOCR API with retry logic for rate limiting
             logger.info(f"Sending request to API: {API_URL}")
             api_start = time.time()
-            response = requests.post(
-                API_URL, json=payload, headers=headers, timeout=600
-            )
+
+            # Retry configuration
+            max_retries = 5
+            base_delay = 2  # Base delay in seconds
+            max_delay = 60  # Maximum delay in seconds
+
+            response = None
+            last_error = None
+
+            for attempt in range(max_retries):
+                try:
+                    response = requests.post(
+                        API_URL, json=payload, headers=headers, timeout=600
+                    )
+
+                    # If successful, break out of retry loop
+                    if response.status_code == 200:
+                        break
+
+                    # Handle 429 (Rate Limit) with retry
+                    if response.status_code == 429:
+                        retry_after = response.headers.get(
+                            "Retry-After"
+                        ) or response.headers.get("retry-after")
+
+                        if retry_after:
+                            try:
+                                wait_time = int(retry_after)
+                            except (ValueError, TypeError):
+                                # If Retry-After is not a number, use exponential backoff
+                                wait_time = min(base_delay * (2**attempt), max_delay)
+                        else:
+                            # No Retry-After header, use exponential backoff
+                            wait_time = min(base_delay * (2**attempt), max_delay)
+
+                        if attempt < max_retries - 1:
+                            logger.warning(
+                                f"Rate limit hit (429) on attempt {attempt + 1}/{max_retries}. "
+                                f"Waiting {wait_time} seconds before retry..."
+                            )
+                            time.sleep(wait_time)
+                            continue
+                        else:
+                            # Last attempt failed
+                            logger.error(
+                                f"Rate limit hit (429) after {max_retries} attempts. "
+                                f"Giving up."
+                            )
+                    else:
+                        # Non-429 error, don't retry
+                        break
+
+                except requests.exceptions.RequestException as e:
+                    last_error = e
+                    if attempt < max_retries - 1:
+                        wait_time = min(base_delay * (2**attempt), max_delay)
+                        logger.warning(
+                            f"Request exception on attempt {attempt + 1}/{max_retries}: {str(e)}. "
+                            f"Waiting {wait_time} seconds before retry..."
+                        )
+                        time.sleep(wait_time)
+                    else:
+                        logger.error(
+                            f"Request failed after {max_retries} attempts: {str(e)}"
+                        )
+
             api_time = time.time() - api_start
             logger.info(f"API call completed in {api_time:.2f} seconds")
 
             # Check response status
-            if response.status_code != 200:
+            if response is None or response.status_code != 200:
                 error_details = {
                     "timestamp": datetime.now().isoformat(),
                     "filename": file.filename,
                     "file_size": file_size,
-                    "status_code": response.status_code,
+                    "status_code": response.status_code
+                    if response
+                    else "RequestException",
                     "api_url": API_URL,
                     "response_time_seconds": round(api_time, 2),
-                    "response_headers": dict(response.headers),
-                    "response_text": response.text[:2000],  # First 2000 chars
-                    "retry_after": response.headers.get("Retry-After")
-                    or response.headers.get("retry-after"),
+                    "response_headers": dict(response.headers) if response else None,
+                    "response_text": (
+                        response.text[:2000] if response else str(last_error)
+                    )
+                    if last_error or response
+                    else "No response",
+                    "retry_after": (
+                        response.headers.get("Retry-After")
+                        or response.headers.get("retry-after")
+                        if response
+                        else None
+                    ),
+                    "retries_attempted": max_retries
+                    if response and response.status_code == 429
+                    else 1,
                 }
 
                 # Log detailed error to file
                 logger.error(
-                    f"API request failed with status code {response.status_code}\n"
+                    f"API request failed with status code {error_details['status_code']}\n"
                     f"Error details: {error_details}"
                 )
+
+                # Provide more specific error message for 429
+                if response and response.status_code == 429:
+                    error_message = (
+                        "Rate limit exceeded. The API is temporarily limiting requests. "
+                        "Please wait a few moments and try again, or process files at a slower rate."
+                    )
+                else:
+                    error_message = (
+                        response.text[:500]
+                        if response
+                        else str(last_error)
+                        if last_error
+                        else "Unknown error"
+                    )
 
                 return (
                     jsonify(
                         {
                             "error": "API request failed",
-                            "status_code": response.status_code,
-                            "message": response.text[:500],
+                            "status_code": error_details["status_code"],
+                            "message": error_message,
                         }
                     ),
-                    500,
+                    500 if response and response.status_code != 429 else 429,
                 )
 
             # Parse response
