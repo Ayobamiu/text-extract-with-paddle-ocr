@@ -191,10 +191,10 @@ def extract_document():
                 "Authorization": f"token {API_TOKEN}",
                 "Content-Type": "application/json",
             }
+            # "useChartRecognition": True,
             payload = {
                 "file": file_data,
                 "fileType": file_type,
-                "useChartRecognition": True,
                 "temperature": 0.2,
             }
 
