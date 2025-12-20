@@ -17,6 +17,8 @@ from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 from utils.extractors import extract_storage_data
 import requests
+from pypdf import PdfReader, PdfWriter
+from typing import List, Dict, Any
 
 # Load environment variables from .env file
 load_dotenv()
@@ -79,6 +81,7 @@ if not max_file_size_str:
     )
 MAX_FILE_SIZE = int(max_file_size_str)
 ALLOWED_EXTENSIONS = {"pdf", "png", "jpg", "jpeg", "bmp", "tiff", "tif"}
+MAX_PAGES_PER_CHUNK = 40  # Paddle API limit
 
 
 def get_file_type(filename: str) -> int:
@@ -98,6 +101,250 @@ def get_file_type(filename: str) -> int:
 def allowed_file(filename: str) -> bool:
     """Check if file extension is allowed."""
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def split_pdf_into_chunks(
+    pdf_path: str, chunk_size: int = MAX_PAGES_PER_CHUNK
+) -> List[str]:
+    """
+    Split a PDF file into chunks of specified page size.
+
+    Args:
+        pdf_path: Path to the PDF file
+        chunk_size: Maximum number of pages per chunk (default: 40)
+
+    Returns:
+        List of temporary file paths for each chunk
+    """
+    chunks = []
+    reader = PdfReader(pdf_path)
+    total_pages = len(reader.pages)
+
+    logger.info(
+        f"Splitting PDF with {total_pages} pages into chunks of {chunk_size} pages"
+    )
+
+    if total_pages <= chunk_size:
+        # No need to split
+        return [pdf_path]
+
+    chunk_count = (total_pages + chunk_size - 1) // chunk_size  # Ceiling division
+
+    for chunk_idx in range(chunk_count):
+        start_page = chunk_idx * chunk_size
+        end_page = min(start_page + chunk_size, total_pages)
+
+        # Create a new PDF writer for this chunk
+        writer = PdfWriter()
+
+        # Add pages to the chunk
+        for page_num in range(start_page, end_page):
+            writer.add_page(reader.pages[page_num])
+
+        # Save chunk to temporary file
+        chunk_file = tempfile.NamedTemporaryFile(
+            delete=False, suffix=".pdf", prefix=f"chunk_{chunk_idx}_"
+        )
+        writer.write(chunk_file)
+        chunk_file.close()
+
+        chunks.append(chunk_file.name)
+        logger.info(
+            f"Created chunk {chunk_idx + 1}/{chunk_count}: pages {start_page + 1}-{end_page} -> {chunk_file.name}"
+        )
+
+    return chunks
+
+
+def merge_chunk_results(
+    chunk_results: List[Dict[str, Any]],
+    document_id: str,
+    extraction_time_seconds: float,
+) -> Dict[str, Any]:
+    """
+    Merge results from multiple PDF chunks into a single result.
+
+    Args:
+        chunk_results: List of storage_data dictionaries from each chunk
+        document_id: Document identifier
+        extraction_time_seconds: Total extraction time
+
+    Returns:
+        Merged storage_data dictionary
+    """
+    if not chunk_results:
+        raise ValueError("No chunk results to merge")
+
+    if len(chunk_results) == 1:
+        # Only one chunk, return as-is (but update extraction time)
+        result = chunk_results[0].copy()
+        if "extractionMetadata" in result:
+            result["extractionMetadata"]["extractionTimeSeconds"] = (
+                extraction_time_seconds
+            )
+        return result
+
+    logger.info(f"Merging {len(chunk_results)} chunk results")
+
+    # Start with the first chunk's structure
+    merged = chunk_results[0].copy()
+
+    # Merge pages from all chunks, adjusting page indices
+    all_pages = []
+    all_raw_pages = []
+    all_page_dimensions = []
+    total_pages = 0
+
+    for chunk_idx, chunk_result in enumerate(chunk_results):
+        chunk_pages = chunk_result.get("pages", [])
+        chunk_metadata = chunk_result.get("extractionMetadata", {})
+        chunk_raw = chunk_result.get("raw_response", {})
+
+        # Get pages from raw response for merging
+        chunk_raw_pages = chunk_raw.get("result", {}).get("layoutParsingResults", [])
+
+        # Get page dimensions
+        chunk_page_dims = chunk_metadata.get("pages", [])
+
+        # Adjust page indices to be sequential across chunks
+        for page in chunk_pages:
+            page["pageIndex"] = total_pages
+            all_pages.append(page)
+            total_pages += 1
+
+        # Collect raw pages
+        all_raw_pages.extend(chunk_raw_pages)
+
+        # Collect page dimensions
+        all_page_dimensions.extend(chunk_page_dims)
+
+    # Update merged result
+    merged["pages"] = all_pages
+
+    # Update extraction metadata
+    if "extractionMetadata" in merged:
+        merged["extractionMetadata"]["numPages"] = total_pages
+        merged["extractionMetadata"]["pages"] = all_page_dimensions
+        merged["extractionMetadata"]["extractionTimeSeconds"] = extraction_time_seconds
+
+    # Merge raw responses
+    if "raw_response" in merged:
+        # Get the structure from first chunk
+        first_raw = chunk_results[0].get("raw_response", {})
+        merged_raw = first_raw.copy()
+
+        # Update layout parsing results
+        if "result" in merged_raw:
+            merged_raw["result"]["layoutParsingResults"] = all_raw_pages
+
+            # Update dataInfo
+            if "dataInfo" in merged_raw["result"]:
+                merged_raw["result"]["dataInfo"]["numPages"] = total_pages
+                merged_raw["result"]["dataInfo"]["pages"] = all_page_dimensions
+
+        merged["raw_response"] = merged_raw
+
+    logger.info(
+        f"Merged result: {total_pages} total pages from {len(chunk_results)} chunks"
+    )
+
+    return merged
+
+
+def process_single_chunk(
+    chunk_path: str, file_type: int, headers: Dict[str, str]
+) -> Dict[str, Any]:
+    """
+    Process a single PDF chunk through the PaddleOCR API.
+
+    Args:
+        chunk_path: Path to the PDF chunk file
+        file_type: File type (0 for PDF, 1 for image)
+        headers: HTTP headers for API request
+
+    Returns:
+        API response JSON
+    """
+    # Read and encode chunk file
+    with open(chunk_path, "rb") as f:
+        file_bytes = f.read()
+        file_data = base64.b64encode(file_bytes).decode("ascii")
+
+    payload = {
+        "file": file_data,
+        "fileType": file_type,
+        "temperature": 0.2,
+    }
+
+    # Call PaddleOCR API with retry logic
+    max_retries = 5
+    base_delay = 2
+    max_delay = 60
+
+    response = None
+    last_error = None
+
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(
+                API_URL, json=payload, headers=headers, timeout=600
+            )
+
+            if response.status_code == 200:
+                break
+
+            if response.status_code == 429:
+                retry_after = response.headers.get(
+                    "Retry-After"
+                ) or response.headers.get("retry-after")
+
+                if retry_after:
+                    try:
+                        wait_time = int(retry_after)
+                    except (ValueError, TypeError):
+                        wait_time = min(base_delay * (2**attempt), max_delay)
+                else:
+                    wait_time = min(base_delay * (2**attempt), max_delay)
+
+                if attempt < max_retries - 1:
+                    logger.warning(
+                        f"Rate limit hit (429) on chunk processing attempt {attempt + 1}/{max_retries}. "
+                        f"Waiting {wait_time} seconds before retry..."
+                    )
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.error(
+                        f"Rate limit hit (429) after {max_retries} attempts for chunk"
+                    )
+            else:
+                break
+
+        except requests.exceptions.RequestException as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                wait_time = min(base_delay * (2**attempt), max_delay)
+                logger.warning(
+                    f"Request exception on chunk processing attempt {attempt + 1}/{max_retries}: {str(e)}. "
+                    f"Waiting {wait_time} seconds before retry..."
+                )
+                time.sleep(wait_time)
+            else:
+                logger.error(
+                    f"Request failed after {max_retries} attempts for chunk: {str(e)}"
+                )
+
+    if response is None or response.status_code != 200:
+        error_msg = (
+            response.text[:500]
+            if response
+            else str(last_error)
+            if last_error
+            else "Unknown error"
+        )
+        raise Exception(f"API request failed for chunk: {error_msg}")
+
+    return response.json()
 
 
 @app.route("/health", methods=["GET"])
@@ -174,195 +421,131 @@ def extract_document():
 
             logger.info(f"File size: {file_size / 1024:.2f} KB")
 
-            # Read and encode file
-            read_start = time.time()
-            with open(temp_path, "rb") as f:
-                file_bytes = f.read()
-                file_data = base64.b64encode(file_bytes).decode("ascii")
-            read_time = time.time() - read_start
-            logger.info(f"File read and encoded in {read_time:.2f} seconds")
-
             # Determine file type
             file_type = get_file_type(file.filename)
             logger.info(f"File type: {'PDF' if file_type == 0 else 'Image'}")
 
-            # Prepare API request
+            # Prepare API request headers
             headers = {
                 "Authorization": f"token {API_TOKEN}",
                 "Content-Type": "application/json",
             }
-            # "useChartRecognition": True,
-            payload = {
-                "file": file_data,
-                "fileType": file_type,
-                "temperature": 0.2,
-            }
-
-            # Call PaddleOCR API with retry logic for rate limiting
-            logger.info(f"Sending request to API: {API_URL}")
-            api_start = time.time()
-
-            # Retry configuration
-            max_retries = 5
-            base_delay = 2  # Base delay in seconds
-            max_delay = 60  # Maximum delay in seconds
-
-            response = None
-            last_error = None
-
-            for attempt in range(max_retries):
-                try:
-                    response = requests.post(
-                        API_URL, json=payload, headers=headers, timeout=600
-                    )
-
-                    # If successful, break out of retry loop
-                    if response.status_code == 200:
-                        break
-
-                    # Handle 429 (Rate Limit) with retry
-                    if response.status_code == 429:
-                        retry_after = response.headers.get(
-                            "Retry-After"
-                        ) or response.headers.get("retry-after")
-
-                        if retry_after:
-                            try:
-                                wait_time = int(retry_after)
-                            except (ValueError, TypeError):
-                                # If Retry-After is not a number, use exponential backoff
-                                wait_time = min(base_delay * (2**attempt), max_delay)
-                        else:
-                            # No Retry-After header, use exponential backoff
-                            wait_time = min(base_delay * (2**attempt), max_delay)
-
-                        if attempt < max_retries - 1:
-                            logger.warning(
-                                f"Rate limit hit (429) on attempt {attempt + 1}/{max_retries}. "
-                                f"Waiting {wait_time} seconds before retry..."
-                            )
-                            time.sleep(wait_time)
-                            continue
-                        else:
-                            # Last attempt failed
-                            logger.error(
-                                f"Rate limit hit (429) after {max_retries} attempts. "
-                                f"Giving up."
-                            )
-                    else:
-                        # Non-429 error, don't retry
-                        break
-
-                except requests.exceptions.RequestException as e:
-                    last_error = e
-                    if attempt < max_retries - 1:
-                        wait_time = min(base_delay * (2**attempt), max_delay)
-                        logger.warning(
-                            f"Request exception on attempt {attempt + 1}/{max_retries}: {str(e)}. "
-                            f"Waiting {wait_time} seconds before retry..."
-                        )
-                        time.sleep(wait_time)
-                    else:
-                        logger.error(
-                            f"Request failed after {max_retries} attempts: {str(e)}"
-                        )
-
-            api_time = time.time() - api_start
-            logger.info(f"API call completed in {api_time:.2f} seconds")
-
-            # Check response status
-            if response is None or response.status_code != 200:
-                error_details = {
-                    "timestamp": datetime.now().isoformat(),
-                    "filename": file.filename,
-                    "file_size": file_size,
-                    "status_code": response.status_code
-                    if response
-                    else "RequestException",
-                    "api_url": API_URL,
-                    "response_time_seconds": round(api_time, 2),
-                    "response_headers": dict(response.headers) if response else None,
-                    "response_text": (
-                        response.text[:2000] if response else str(last_error)
-                    )
-                    if last_error or response
-                    else "No response",
-                    "retry_after": (
-                        response.headers.get("Retry-After")
-                        or response.headers.get("retry-after")
-                        if response
-                        else None
-                    ),
-                    "retries_attempted": max_retries
-                    if response and response.status_code == 429
-                    else 1,
-                }
-
-                # Log detailed error to file
-                logger.error(
-                    f"API request failed with status code {error_details['status_code']}\n"
-                    f"Error details: {error_details}"
-                )
-
-                # Provide more specific error message for 429
-                if response and response.status_code == 429:
-                    error_message = (
-                        "Rate limit exceeded. The API is temporarily limiting requests. "
-                        "Please wait a few moments and try again, or process files at a slower rate."
-                    )
-                else:
-                    error_message = (
-                        response.text[:500]
-                        if response
-                        else str(last_error)
-                        if last_error
-                        else "Unknown error"
-                    )
-
-                return (
-                    jsonify(
-                        {
-                            "error": "API request failed",
-                            "status_code": error_details["status_code"],
-                            "message": error_message,
-                        }
-                    ),
-                    500 if response and response.status_code != 429 else 429,
-                )
-
-            # Parse response
-            response_json = response.json()
-            logger.info("API request successful")
 
             # Extract document ID from filename
             document_id = os.path.splitext(secure_filename(file.filename))[0]
 
-            # Calculate total extraction time
-            extraction_time = time.time() - start_time
+            # Check if PDF needs chunking
+            chunk_paths = []
 
-            # Extract storage data
-            logger.info("Extracting storage data...")
-            storage_extract_start = time.time()
-            storage_data = extract_storage_data(
-                response_json,
-                document_id=document_id,
-                extraction_time_seconds=round(extraction_time, 2),
-            )
-            storage_extract_time = time.time() - storage_extract_start
-            logger.info(f"Storage data extracted in {storage_extract_time:.2f} seconds")
+            if file_type == 0:  # PDF
+                try:
+                    reader = PdfReader(temp_path)
+                    total_pages = len(reader.pages)
+                    logger.info(f"PDF has {total_pages} pages")
 
-            logger.info(
-                f"Extraction complete: {len(storage_data['pages'])} pages, "
-                f"{sum(len(page['sourceBlocks']) for page in storage_data['pages'])} total blocks"
-            )
+                    if total_pages > MAX_PAGES_PER_CHUNK:
+                        needs_chunking = True
+                        logger.info(
+                            f"PDF exceeds {MAX_PAGES_PER_CHUNK} page limit, will split into chunks"
+                        )
+                        chunk_paths = split_pdf_into_chunks(temp_path)
+                    else:
+                        chunk_paths = [temp_path]
+                except Exception as e:
+                    logger.error(f"Error reading PDF: {str(e)}")
+                    return (
+                        jsonify(
+                            {"error": "Failed to read PDF file", "message": str(e)}
+                        ),
+                        400,
+                    )
+            else:
+                # Image file, no chunking needed
+                chunk_paths = [temp_path]
 
-            # Include both processed storage_data and raw PaddleOCR response
-            response_data = {
-                **storage_data,
-                "raw_response": response_json,  # Include raw, unconverted PaddleOCR response
-            }
+            # Process chunks
+            chunk_results = []
+            chunk_temp_files = []  # Track chunk files to clean up
 
-            return jsonify(response_data), 200
+            try:
+                for chunk_idx, chunk_path in enumerate(chunk_paths):
+                    logger.info(
+                        f"Processing chunk {chunk_idx + 1}/{len(chunk_paths)}: {chunk_path}"
+                    )
+
+                    # Track if this is a temporary chunk file (not the original)
+                    is_temp_chunk = chunk_path != temp_path
+                    if is_temp_chunk:
+                        chunk_temp_files.append(chunk_path)
+
+                    # Process chunk
+                    api_start = time.time()
+                    response_json = process_single_chunk(chunk_path, file_type, headers)
+                    api_time = time.time() - api_start
+                    logger.info(
+                        f"Chunk {chunk_idx + 1} processed in {api_time:.2f} seconds"
+                    )
+
+                    # Extract storage data for this chunk
+                    storage_data = extract_storage_data(
+                        response_json,
+                        document_id=document_id,
+                        extraction_time_seconds=round(api_time, 2),
+                    )
+
+                    # Include raw response for merging
+                    storage_data["raw_response"] = response_json
+                    chunk_results.append(storage_data)
+
+                # Merge results if multiple chunks
+                if len(chunk_results) > 1:
+                    logger.info("Merging chunk results...")
+                    extraction_time = time.time() - start_time
+                    merged_result = merge_chunk_results(
+                        chunk_results,
+                        document_id=document_id,
+                        extraction_time_seconds=round(extraction_time, 2),
+                    )
+                    response_data = merged_result
+                else:
+                    # Single chunk, update extraction time
+                    extraction_time = time.time() - start_time
+                    chunk_results[0]["extractionMetadata"]["extractionTimeSeconds"] = (
+                        round(extraction_time, 2)
+                    )
+                    response_data = chunk_results[0]
+
+                logger.info(
+                    f"Extraction complete: {len(response_data['pages'])} pages, "
+                    f"{sum(len(page['sourceBlocks']) for page in response_data['pages'])} total blocks"
+                )
+
+                return jsonify(response_data), 200
+
+            except Exception as chunk_error:
+                logger.error(
+                    f"Error processing chunks: {str(chunk_error)}", exc_info=True
+                )
+                return (
+                    jsonify(
+                        {
+                            "error": "Error processing document chunks",
+                            "message": str(chunk_error),
+                        }
+                    ),
+                    500,
+                )
+            finally:
+                # Clean up temporary chunk files
+                for chunk_file in chunk_temp_files:
+                    if os.path.exists(chunk_file):
+                        try:
+                            os.remove(chunk_file)
+                            logger.debug(f"Cleaned up chunk file: {chunk_file}")
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to clean up chunk file {chunk_file}: {e}"
+                            )
 
         finally:
             # Clean up temporary file
