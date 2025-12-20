@@ -270,11 +270,16 @@ def process_single_chunk(
         file_bytes = f.read()
         file_data = base64.b64encode(file_bytes).decode("ascii")
 
-    payload = {
+    required_payload = {
         "file": file_data,
         "fileType": file_type,
         "temperature": 0.2,
     }
+    optional_payload = {
+        "useDocUnwarping": True,
+        "repetitionPenalty": 1.2,  # Helps reduce duplicate text
+    }
+    payload = {**required_payload, **optional_payload}
 
     # Call PaddleOCR API with retry logic
     max_retries = 5
